@@ -1,0 +1,34 @@
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+*.env
+
+# IDE/editor settings
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Local crawler/runtime data and generated outputs
+data/
+*.log
+
+# Local config / secrets
+collection_config.json
+
+# Other local metadata
+.agents/
+.cursor/

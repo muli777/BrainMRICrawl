@@ -1,0 +1,37 @@
+{
+  "email": "your-email@example.com",
+  "ncbi_api_key": "YOUR_NCBI_API_KEY",
+  "output_dir": "data",
+  "max_records_per_query": 220,
+  "download_open_access_fulltext": true,
+  "continuous_mode": true,
+  "notes": "面向脑部 MRI RAG：优先指南/共识、系统综述/Meta、高质量综述与典型临床研究；覆盖脑血管、脑肿瘤、神经内科、精神类疾病。",
+  "pubmed_queries": [
+    {
+      "label": "cerebrovascular_guideline",
+      "disease_category": "cerebrovascular",
+      "doc_type": "guideline",
+      "query": "((MRI[Title/Abstract] OR \"magnetic resonance imaging\"[Title/Abstract] OR neuroimaging[Title/Abstract]) AND (stroke[Title/Abstract] OR \"cerebral infarction\"[Title/Abstract] OR \"intracerebral hemorrhage\"[Title/Abstract] OR \"subarachnoid hemorrhage\"[Title/Abstract] OR \"cerebral aneurysm\"[Title/Abstract] OR \"moyamoya\"[Title/Abstract]) AND (Guideline[Publication Type] OR Practice Guideline[Publication Type] OR Consensus Development Conference[Publication Type] OR consensus[Title/Abstract] OR recommendation*[Title/Abstract])) AND (brain[Title/Abstract] OR cerebral[Title/Abstract] OR cerebrovascular[Title/Abstract])"
+    },
+    {
+      "label": "brain_tumor_review",
+      "disease_category": "brain_tumor",
+      "doc_type": "review",
+      "query": "((MRI[Title/Abstract] OR \"magnetic resonance imaging\"[Title/Abstract]) AND (glioma[Title/Abstract] OR glioblastoma[Title/Abstract] OR meningioma[Title/Abstract] OR \"brain metastases\"[Title/Abstract] OR \"Brain Neoplasms\"[MeSH]) AND (Review[Publication Type] OR Systematic Review[Publication Type] OR Meta-Analysis[Publication Type])) AND english[lang] AND (\"2015\"[Date - Publication] : \"3000\"[Date - Publication])"
+    }
+  ],
+  "europepmc_queries": [
+    {
+      "label": "cerebrovascular_oa_guideline",
+      "disease_category": "cerebrovascular",
+      "doc_type": "guideline",
+      "query": "(TITLE_ABS:(MRI OR \"magnetic resonance imaging\") AND TITLE_ABS:(stroke OR \"ischemic stroke\" OR \"intracerebral hemorrhage\" OR \"subarachnoid hemorrhage\" OR aneurysm) AND (PUB_TYPE:guideline OR TITLE_ABS:(guideline OR consensus OR recommendation))) AND OPEN_ACCESS:Y"
+    },
+    {
+      "label": "brain_tumor_oa_review",
+      "disease_category": "brain_tumor",
+      "doc_type": "review",
+      "query": "(TITLE_ABS:(MRI OR \"magnetic resonance imaging\") AND TITLE_ABS:(glioma OR glioblastoma OR meningioma OR \"brain metastases\") AND (PUB_TYPE:review OR TITLE_ABS:(\"systematic review\" OR \"meta-analysis\"))) AND OPEN_ACCESS:Y AND (FIRST_PDATE:[2015 TO 3000])"
+    }
+  ]
+}

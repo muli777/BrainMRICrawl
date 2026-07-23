@@ -24,6 +24,8 @@ env/
 
 # Local crawler/runtime data and generated outputs
 data/
+data1/
+DataClean/
 *.log
 
 # Local config / secrets

@@ -10,6 +10,7 @@ import argparse
 import datetime as dt
 import json
 import re
+import ssl
 import time
 import urllib.parse
 import urllib.error
@@ -217,24 +218,48 @@ def normalize_query_entry(entry: str | dict[str, Any]) -> dict[str, str]:
 
 
 class HttpClient:
-    def __init__(self, email: str, min_interval_seconds: float = 0.4) -> None:
+    def __init__(self, email: str, min_interval_seconds: float = 0.4, verify_ssl: bool = True) -> None:
         self.email = email
         self.min_interval_seconds = min_interval_seconds
         self._last_request = 0.0
+        self._ssl_context = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
 
     def get(self, url: str, params: dict[str, Any] | None = None) -> bytes:
         if params:
             url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
-        wait = self.min_interval_seconds - (time.monotonic() - self._last_request)
-        if wait > 0:
-            time.sleep(wait)
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/xml, application/json, text/plain"})
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                payload = response.read()
-        finally:
-            self._last_request = time.monotonic()
-        return payload
+        
+        for attempt in range(5):
+            wait = self.min_interval_seconds - (time.monotonic() - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                with urllib.request.urlopen(request, context=self._ssl_context, timeout=60) as response:
+                    payload = response.read()
+                self._last_request = time.monotonic()
+                return payload
+            except urllib.error.HTTPError as exc:
+                self._last_request = time.monotonic()
+                if exc.code == 429 and attempt < 4:
+                    backoff = min(2 ** attempt * 1.0, 30.0)
+                    print(f"HTTP 429 Rate Limit - Retrying in {backoff:.1f}s (attempt {attempt + 1}/5)")
+                    time.sleep(backoff)
+                    continue
+                raise
+            except urllib.error.URLError as exc:
+                self._last_request = time.monotonic()
+                reason_str = str(exc.reason) if exc.reason else "unknown"
+                if "CERTIFICATE_VERIFY_FAILED" in reason_str:
+                    print(f"SSL certificate error - Disabling SSL verification")
+                    self._ssl_context = ssl._create_unverified_context()
+                    continue
+                if attempt < 4:
+                    backoff = min(2 ** attempt * 0.5, 10.0)
+                    print(f"Network error - Retrying in {backoff:.1f}s (attempt {attempt + 1}/5)")
+                    time.sleep(backoff)
+                    continue
+                raise
+        raise RuntimeError(f"Failed to fetch {url} after 5 attempts")
 
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -446,7 +471,8 @@ def crawl_once(config: dict[str, Any]) -> CrawlProgress:
     fulltext_dir = output / "europepmc_fulltext"
     output.mkdir(parents=True, exist_ok=True)
     fulltext_dir.mkdir(parents=True, exist_ok=True)
-    client = HttpClient(email=email)
+    verify_ssl = config.get("verify_ssl", True)
+    client = HttpClient(email=email, verify_ssl=verify_ssl)
     limit = int(config.get("max_records_per_query", 100))
     api_key = config.get("ncbi_api_key", "")
     manifest = output / "collection_manifest.jsonl"

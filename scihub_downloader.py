@@ -10,6 +10,9 @@ Usage:
 Features:
     - Extracts DOIs from all CSV files in a directory
     - Configurable Sci-Hub mirror URLs with fallback
+    - Cloudflare bypass using cloudscraper
+    - Cookie persistence for reduced Cloudflare challenges
+    - Unpaywall API as legal Open Access fallback
     - DOI format validation
     - Skip-if-already-downloaded logic
     - Download retry with exponential backoff
@@ -24,21 +27,28 @@ import csv
 import datetime as dt
 import json
 import re
+import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
+
+import cloudscraper
+from curl_cffi import requests
 
 # Default Sci-Hub mirrors (may need updating as domains get blocked)
 # Ordered by reliability based on testing
 SCIHUB_MIRRORS = [
-    "https://sci-hub.mksa.top",
     "https://sci-hub.se",
     "https://sci-hub.ru",
     "https://sci-hub.st",
+    "https://sci-hub.mksa.top",
     "https://sci-hub.ren",
+    "https://sci-hub.ru.hr",
+    "https://sci-hub.tw",
+    "https://sci-hub.ee",
 ]
 
 # DOI regex pattern for validation
@@ -46,6 +56,12 @@ DOI_PATTERN = re.compile(r"^10\.\d{4,9}/[-._;()/:A-Z0-9]+$", re.IGNORECASE)
 
 # Default user agent
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# Unpaywall API (legal Open Access fallback)
+UNPAYWALL_API = "https://api.unpaywall.org/v2/{doi}?email={email}"
+
+# Global cache for dead mirrors (DNS resolution failures)
+DEAD_MIRRORS: set[str] = set()
 
 
 def format_elapsed(seconds: float) -> str:
@@ -179,8 +195,25 @@ def doi_to_filename(doi: str) -> str:
 
 def append_manifest(path: Path, record: dict[str, Any]) -> None:
     """Append record to manifest JSONL file."""
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    safe_write(path, json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def safe_write(file_path: Path, content: str, max_retries: int = 3, delay: float = 1.0) -> bool:
+    """Safely write content to file with retry on PermissionError."""
+    for attempt in range(max_retries):
+        try:
+            with file_path.open("a", encoding="utf-8") as f:
+                f.write(content)
+            return True
+        except PermissionError:
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                print(f"  警告: 无法写入文件 {file_path}，权限被拒绝")
+                return False
+        except Exception as e:
+            print(f"  警告: 写入文件失败: {str(e)}")
+            return False
 
 
 def load_existing_downloads(output_dir: Path) -> set[str]:
@@ -197,6 +230,23 @@ def load_existing_downloads(output_dir: Path) -> set[str]:
                 except json.JSONDecodeError:
                     continue
     return existing
+
+
+def load_cookies(output_dir: Path) -> Dict[str, str]:
+    """Load saved cookies from file."""
+    cookies_file = output_dir / "cookies.json"
+    if cookies_file.exists():
+        try:
+            return json.loads(cookies_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_cookies(output_dir: Path, cookies: Dict[str, str]) -> None:
+    """Save cookies to file."""
+    cookies_file = output_dir / "cookies.json"
+    cookies_file.write_text(json.dumps(cookies, ensure_ascii=False), encoding="utf-8")
 
 
 def extract_pdf_url_from_html(html_content: bytes, mirror: str) -> Optional[str]:
@@ -255,83 +305,164 @@ def extract_pdf_url_from_html(html_content: bytes, mirror: str) -> Optional[str]
     return None
 
 
-def download_pdf(doi: str, output_dir: Path, mirrors: list[str], max_retries: int = 3) -> tuple[bool, str]:
-    """Download PDF from Sci-Hub with retry and mirror fallback."""
+def download_from_unpaywall(doi: str, output_dir: Path, email: str = "researcher@mailinator.com") -> tuple[bool, str]:
+    """Try to download PDF from Unpaywall (legal Open Access)."""
     filename = doi_to_filename(doi)
     destination = output_dir / filename
     
     if destination.exists():
         return True, "already_exists"
     
+    try:
+        # URL encode the DOI to handle special characters
+        encoded_doi = urllib.parse.quote(doi, safe="")
+        url = UNPAYWALL_API.format(doi=encoded_doi, email=email)
+        print(f"  查询Unpaywall: {url[:80]}...")
+        
+        # Use curl_cffi for better SSL handling
+        response = requests.get(url, impersonate="chrome120", timeout=30)
+        
+        if response.status_code == 422:
+            print("  Unpaywall拒绝了该邮箱地址，请使用--email参数提供其他邮箱")
+            return False, "unpaywall_invalid_email"
+        
+        if response.status_code != 200:
+            print(f"  Unpaywall返回错误: {response.status_code}")
+            return False, f"unpaywall_status_{response.status_code}"
+        
+        data = response.json()
+        
+        if data.get("is_oa") and data.get("best_oa_location"):
+            pdf_url = data["best_oa_location"].get("url_for_pdf")
+            if pdf_url:
+                print(f"  尝试从Unpaywall下载: {pdf_url[:60]}...")
+                pdf_response = requests.get(pdf_url, impersonate="chrome120", timeout=60)
+                if pdf_response.status_code == 200 and pdf_response.content[:4] == b"%PDF":
+                    destination.write_bytes(pdf_response.content)
+                    return True, "downloaded_from_unpaywall"
+        return False, "unpaywall_no_oa"
+    except Exception as exc:
+        print(f"  Unpaywall请求失败: {str(exc)[:50]}")
+        return False, f"unpaywall_error:{str(exc)[:30]}"
+
+
+def download_pdf(doi: str, output_dir: Path, mirrors: list[str], max_retries: int = 3, email: str = "researcher@mailinator.com", proxy: str = "") -> tuple[bool, str]:
+    """Download PDF from Sci-Hub with retry and mirror fallback using curl_cffi."""
+    filename = doi_to_filename(doi)
+    destination = output_dir / filename
+    
+    if destination.exists():
+        return True, "already_exists"
+    
+    # Load saved cookies
+    cookies = load_cookies(output_dir)
+    
+    # Build curl_cffi options
+    curl_options = {"impersonate": "chrome120", "timeout": 60, "cookies": cookies}
+    if proxy:
+        curl_options["proxy"] = proxy
+    
     for mirror in mirrors:
+        # Skip dead mirrors (DNS resolution failures)
+        if mirror in DEAD_MIRRORS:
+            print(f"  跳过已标记为不可用的镜像: {mirror[:30]}")
+            continue
+        
         for attempt in range(max_retries):
             try:
-                # First try direct download URL
+                # First try with curl_cffi impersonating Chrome
                 url = f"{mirror}/{doi}"
-                request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                print(f"  尝试: {url[:60]}...")
                 
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    content_type = response.headers.get("Content-Type", "")
-                    content = response.read()
-                    
-                    # Check if response is PDF directly
-                    if "application/pdf" in content_type or content[:4] == b"%PDF":
-                        destination.write_bytes(content)
-                        return True, f"downloaded_directly_from_{mirror}"
-                    
-                    # Check for captcha or cloudflare
-                    if b"captcha" in content.lower() or b"cloudflare" in content.lower():
-                        print(f"  检测到验证码/Cloudflare，尝试下一个镜像...")
-                        break
-                    
-                    # Try to extract PDF URL from HTML
-                    pdf_url = extract_pdf_url_from_html(content, mirror)
-                    if pdf_url:
-                        print(f"  找到PDF链接: {pdf_url[:60]}...")
-                        pdf_request = urllib.request.Request(pdf_url, headers={"User-Agent": USER_AGENT})
-                        with urllib.request.urlopen(pdf_request, timeout=60) as pdf_response:
-                            pdf_content = pdf_response.read()
-                            if pdf_content[:4] == b"%PDF":
-                                destination.write_bytes(pdf_content)
-                                return True, f"downloaded_via_html_from_{mirror}"
-                            else:
-                                print(f"  获取的内容不是PDF，尝试其他方式...")
+                response = requests.get(url, **curl_options)
+                content = response.content
                 
-                # Try alternative URL formats
-                for alt_format in ["/downloads/{doi}.pdf", "/doi/{doi}"]:
-                    alt_url = mirror.rstrip("/") + alt_format.format(doi=doi)
-                    try:
-                        alt_request = urllib.request.Request(alt_url, headers={"User-Agent": USER_AGENT})
-                        with urllib.request.urlopen(alt_request, timeout=60) as alt_response:
-                            alt_content = alt_response.read()
-                            if alt_content[:4] == b"%PDF":
-                                destination.write_bytes(alt_content)
-                                return True, f"downloaded_alt_format_from_{mirror}"
-                    except urllib.error.HTTPError:
-                        continue
-                    except Exception:
-                        continue
+                # Save cookies for reuse
+                if response.cookies:
+                    new_cookies = {str(k): str(v) for k, v in response.cookies.items()}
+                    cookies.update(new_cookies)
+                    save_cookies(output_dir, cookies)
                 
-            except urllib.error.HTTPError as exc:
-                if exc.code == 404:
-                    break  # Move to next mirror
-                elif exc.code == 429:
-                    wait = 2 ** attempt * 5
-                    print(f"  请求被限制，等待 {wait} 秒后重试...")
-                    time.sleep(wait)
-                    continue
-                else:
-                    print(f"  HTTP错误 {exc.code}，尝试下一个镜像...")
+                # Check if response is PDF directly
+                content_type = response.headers.get("content-type", "")
+                if "application/pdf" in content_type.lower() or content[:4] == b"%PDF":
+                    destination.write_bytes(content)
+                    return True, f"downloaded_directly_from_{mirror}"
+                
+                # Check for captcha or cloudflare
+                if b"captcha" in content.lower() or b"cloudflare" in content.lower():
+                    print(f"  检测到验证码/Cloudflare，尝试下一个镜像...")
                     break
-            except urllib.error.URLError as exc:
-                print(f"  网络错误: {exc.reason}，尝试下一个镜像...")
-                break
+                
+                # Try to extract PDF URL from HTML
+                pdf_url = extract_pdf_url_from_html(content, mirror)
+                if pdf_url:
+                    print(f"  找到PDF链接: {pdf_url[:60]}...")
+                    pdf_response = requests.get(pdf_url, impersonate="chrome120", timeout=60)
+                    pdf_content = pdf_response.content
+                    if pdf_content[:4] == b"%PDF":
+                        destination.write_bytes(pdf_content)
+                        return True, f"downloaded_via_html_from_{mirror}"
+                    else:
+                        print(f"  获取的内容不是PDF，尝试其他方式...")
+            
             except Exception as exc:
                 print(f"  下载异常: {str(exc)[:50]}")
+                # Mark mirror as dead if DNS resolution fails
+                if "Could not resolve host" in str(exc):
+                    DEAD_MIRRORS.add(mirror)
+                    print(f"  标记镜像 {mirror} 为不可用")
+                    break  # Skip to next mirror immediately
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt * 3
                     print(f"  等待 {wait} 秒后重试...")
                     time.sleep(wait)
+                else:
+                    print(f"  尝试下一个镜像...")
+    
+    # Try Unpaywall first (legal and DNS-unblocked)
+    print(f"  尝试Unpaywall (开放获取)...")
+    success, status = download_from_unpaywall(doi, output_dir, email)
+    if success:
+        return True, status
+    
+    # Try with cloudscraper
+    print(f"  Unpaywall无开放获取版本，尝试cloudscraper...")
+    for mirror in mirrors:
+        if mirror in DEAD_MIRRORS:
+            continue
+        
+        for attempt in range(max_retries):
+            try:
+                scraper = cloudscraper.create_scraper()
+                url = f"{mirror}/{doi}"
+                
+                scraper_kwargs = {"timeout": 60}
+                if proxy:
+                    scraper_kwargs["proxies"] = {"http": proxy, "https": proxy}
+                
+                response = scraper.get(url, **scraper_kwargs)
+                content = response.content
+                
+                if "application/pdf" in response.headers.get("Content-Type", "") or content[:4] == b"%PDF":
+                    destination.write_bytes(content)
+                    return True, f"downloaded_cloudscraper_from_{mirror}"
+                
+                pdf_url = extract_pdf_url_from_html(content, mirror)
+                if pdf_url:
+                    pdf_response = scraper.get(pdf_url, timeout=60)
+                    pdf_content = pdf_response.content
+                    if pdf_content[:4] == b"%PDF":
+                        destination.write_bytes(pdf_content)
+                        return True, f"downloaded_cloudscraper_html_from_{mirror}"
+            
+            except Exception as exc:
+                print(f"  cloudscraper异常: {str(exc)[:30]}")
+                if "Could not resolve host" in str(exc):
+                    DEAD_MIRRORS.add(mirror)
+                    break
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt * 2)
     
     return False, "all_mirrors_failed"
 
@@ -344,6 +475,8 @@ def main() -> None:
     parser.add_argument("--mirrors", nargs="+", default=SCIHUB_MIRRORS, help="Sci-Hub镜像地址列表")
     parser.add_argument("--max-retries", type=int, default=3, help="每个镜像的最大重试次数")
     parser.add_argument("--delay", type=float, default=2.0, help="下载间隔时间(秒)")
+    parser.add_argument("--email", default="researcher@mailinator.com", help="Unpaywall API邮箱地址（格式正确即可，无需真实邮箱）")
+    parser.add_argument("--proxy", default="", help="HTTP/SOCKS5代理地址，如: http://proxy.example.com:8080 或 socks5://localhost:1080")
     args = parser.parse_args()
 
     csv_dir = Path(args.csv_dir)
@@ -402,6 +535,33 @@ def main() -> None:
     progress.start()
     
     last_request = 0.0
+    
+    # CSV output files (fixed names, append mode)
+    success_csv = output_dir / "download_success.csv"
+    failure_csv = output_dir / "download_failure.csv"
+    
+    # Initialize CSV files with headers if they don't exist
+    if not success_csv.exists():
+        for attempt in range(3):
+            try:
+                with success_csv.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=["doi", "filename", "reason", "timestamp"])
+                    writer.writeheader()
+                break
+            except PermissionError:
+                if attempt < 2:
+                    time.sleep(1)
+    
+    if not failure_csv.exists():
+        for attempt in range(3):
+            try:
+                with failure_csv.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=["doi", "reason", "timestamp"])
+                    writer.writeheader()
+                break
+            except PermissionError:
+                if attempt < 2:
+                    time.sleep(1)
 
     for idx, doi in enumerate(dois, start=1):
         print(f"\n[{idx}/{len(dois)}] 处理 DOI: {doi[:50]}...")
@@ -424,15 +584,51 @@ def main() -> None:
             time.sleep(wait)
         
         # Download
-        success, status = download_pdf(doi, output_dir, args.mirrors, args.max_retries)
+        success, status = download_pdf(doi, output_dir, args.mirrors, args.max_retries, args.email, args.proxy)
         last_request = time.monotonic()
         
         if success:
             print(f"  ✓ 下载成功")
             progress.increment("success")
+            filename = doi_to_filename(doi)
+            record = {
+                "doi": doi,
+                "filename": filename,
+                "reason": status,
+                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+            # Append to success CSV with retry
+            for attempt in range(3):
+                try:
+                    with success_csv.open("a", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=["doi", "filename", "reason", "timestamp"])
+                        writer.writerow(record)
+                    break
+                except PermissionError:
+                    if attempt < 2:
+                        time.sleep(1)
+                    else:
+                        print(f"  警告: 无法写入 success CSV")
         else:
             print(f"  ✗ 下载失败: {status}")
             progress.increment("failure")
+            record = {
+                "doi": doi,
+                "reason": status,
+                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+            # Append to failure CSV with retry
+            for attempt in range(3):
+                try:
+                    with failure_csv.open("a", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=["doi", "reason", "timestamp"])
+                        writer.writerow(record)
+                    break
+                except PermissionError:
+                    if attempt < 2:
+                        time.sleep(1)
+                    else:
+                        print(f"  警告: 无法写入 failure CSV")
         
         # Record in manifest
         append_manifest(manifest_file, {
@@ -443,6 +639,9 @@ def main() -> None:
             "filename": doi_to_filename(doi) if success else None,
         })
 
+    print(f"\n成功记录已保存到: {success_csv}")
+    print(f"失败记录已保存到: {failure_csv}")
+    
     progress.final_report()
     print(f"\n下载完成！PDF文件保存在: {output_dir}")
 

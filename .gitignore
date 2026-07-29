@@ -25,7 +25,9 @@ env/
 # Local crawler/runtime data and generated outputs
 data/
 *.log
-
+data1/
+DataClean/
+cleandata/
 # Local config / secrets
 collection_config.json
 
